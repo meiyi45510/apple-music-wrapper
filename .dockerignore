@@ -1,0 +1,16 @@
+*
+
+!Dockerfile
+!CMakeLists.txt
+!VERSION
+!*.c
+!*.cpp
+!*.h
+!scripts/
+!scripts/*.py
+!rootfs/
+!rootfs/**
+
+**/.DS_Store
+rootfs/system/bin/runtime
+rootfs/system/usr/share/zoneinfo/tzdata

@@ -1,0 +1,14 @@
+.DS_Store
+.idea/
+__pycache__/
+
+build/
+cmake-build-*/
+
+android-ndk-r23b/
+android-ndk-r23b-linux.zip
+
+/data/
+
+rootfs/system/bin/runtime
+rootfs/system/usr/share/zoneinfo/tzdata

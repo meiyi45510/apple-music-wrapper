@@ -1,0 +1,261 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VERSION_FILE="$ROOT_DIR/VERSION"
+IMAGE_NAME="${IMAGE_NAME:-apple-music-wrapper}"
+PLATFORM="${PLATFORM:-linux/arm64}"
+DATA_DIR="${DATA_DIR:-$ROOT_DIR/data}"
+CONTAINER_DATA_DIR="/data/data/com.apple.android.music/files"
+HOST="${HOST:-0.0.0.0}"
+PUBLISH_HOST="${PUBLISH_HOST:-127.0.0.1}"
+DECRYPT_PORT="${DECRYPT_PORT:-10020}"
+M3U8_PORT="${M3U8_PORT:-20020}"
+ACCOUNT_PORT="${ACCOUNT_PORT:-30020}"
+
+show_help() {
+  cat <<EOF
+usage: wrapper <cmd> [args]
+
+cmd:
+  build                build image
+  login [apple-id]     login
+  start                start
+  2fa <code>           save 2fa
+  account              account info
+  help                 help
+  version              version
+
+env:
+  IMAGE_NAME           image [$IMAGE_NAME]
+  PLATFORM             platform [$PLATFORM]
+  DATA_DIR             data dir [$DATA_DIR]
+  HOST                 host [$HOST]
+  PUBLISH_HOST         publish host [$PUBLISH_HOST]
+  DECRYPT_PORT         decrypt port [$DECRYPT_PORT]
+  M3U8_PORT            m3u8 port [$M3U8_PORT]
+  ACCOUNT_PORT         account port [$ACCOUNT_PORT]
+EOF
+}
+
+usage_error() {
+  local subject="$1"
+  local detail="$2"
+
+  printf '%s: %s\n' "$subject" "$detail" >&2
+  show_help >&2
+  return 1
+}
+
+require_no_args() {
+  if [[ "$#" -ne 0 ]]; then
+    usage_error "unexpected argument" "$1"
+    return 1
+  fi
+}
+
+require_max_one_arg() {
+  if [[ "$#" -gt 1 ]]; then
+    usage_error "unexpected argument" "$2"
+    return 1
+  fi
+}
+
+print_version() {
+  local version=""
+
+  if ! IFS= read -r version <"$VERSION_FILE" || [[ -z "$version" ]]; then
+    printf 'version file missing or empty: %s\n' "$VERSION_FILE" >&2
+    return 1
+  fi
+
+  printf 'wrapper %s\n' "$version"
+}
+
+ensure_data_dir() {
+  mkdir -p "$DATA_DIR"
+}
+
+image_exists() {
+  docker image inspect "$IMAGE_NAME" >/dev/null 2>&1
+}
+
+build_image() {
+  docker build --platform "$PLATFORM" -t "$IMAGE_NAME" "$ROOT_DIR"
+}
+
+ensure_image() {
+  if ! image_exists; then
+    printf 'image missing: %s\n' "$IMAGE_NAME" >&2
+    build_image
+  fi
+}
+
+warn_exposed_ports() {
+  if [[ "$PUBLISH_HOST" != "127.0.0.1" && "$PUBLISH_HOST" != "localhost" ]]; then
+    printf 'publish host exposed: %s\n' "$PUBLISH_HOST" >&2
+  fi
+}
+
+run_container() {
+  warn_exposed_ports
+  docker run --rm -it \
+    -p "${PUBLISH_HOST}:${DECRYPT_PORT}:10020" \
+    -p "${PUBLISH_HOST}:${M3U8_PORT}:20020" \
+    -p "${PUBLISH_HOST}:${ACCOUNT_PORT}:30020" \
+    -v "${DATA_DIR}:/app/rootfs/data/data/com.apple.android.music/files" \
+    "$IMAGE_NAME" \
+    "$@"
+}
+
+prompt_nonempty() {
+  local label="$1"
+  local value=""
+  while [[ -z "$value" ]]; do
+    read -r -p "$label: " value
+  done
+  printf '%s' "$value"
+}
+
+prompt_password() {
+  local label="${1:-password}"
+  local value=""
+  while [[ -z "$value" ]]; do
+    read -r -s -p "$label: " value
+    printf '\n' >&2
+  done
+  printf '%s' "$value"
+}
+
+create_password_file() {
+  local password="$1"
+  local path=""
+
+  path="$(mktemp "$DATA_DIR/.wrapper-password.XXXXXX")"
+  chmod 600 "$path"
+  printf '%s' "$password" >"$path"
+  printf '%s' "$path"
+}
+
+remove_file() {
+  local path="${1:-}"
+  if [[ -n "$path" ]]; then
+    rm -f "$path"
+  fi
+}
+
+cmd_login() {
+  local apple_id="${1:-}"
+  local password=""
+  local password_file=""
+  local container_password_file=""
+  local status=0
+
+  require_max_one_arg "$@" || return 1
+
+  ensure_data_dir
+  ensure_image
+
+  if [[ -z "$apple_id" ]]; then
+    apple_id="$(prompt_nonempty "apple-id")"
+  fi
+  password="$(prompt_password "password")"
+  password_file="$(create_password_file "$password")"
+  container_password_file="${CONTAINER_DATA_DIR}/$(basename "$password_file")"
+  unset password
+
+  if run_container --host "$HOST" --login "$apple_id" --password-file "$container_password_file" --read-2fa-file; then
+    status=0
+  else
+    status=$?
+  fi
+
+  remove_file "$password_file"
+  return "$status"
+}
+
+cmd_start() {
+  require_no_args "$@" || return 1
+  ensure_data_dir
+  ensure_image
+  run_container --host "$HOST"
+}
+
+cmd_2fa() {
+  local code=""
+
+  if [[ "$#" -eq 0 ]]; then
+    usage_error "2fa" "missing code"
+    return 1
+  fi
+  if [[ "$#" -gt 1 ]]; then
+    usage_error "unexpected argument" "$2"
+    return 1
+  fi
+  code="$1"
+
+  ensure_data_dir
+  printf '%s' "$code" >"$DATA_DIR/2fa.txt"
+  printf '2fa saved: %s\n' "$DATA_DIR/2fa.txt"
+}
+
+cmd_account() {
+  local account_host="$PUBLISH_HOST"
+  local response=""
+
+  require_no_args "$@" || return 1
+
+  if ! response="$(curl -fsS "http://${account_host}:${ACCOUNT_PORT}/" 2>&1)"; then
+    printf 'account request: %s\n' "$response" >&2
+    return 1
+  fi
+
+  printf '%s\n' "$response"
+}
+
+main() {
+  local cmd="${1:-help}"
+  shift || true
+
+  case "$cmd" in
+    -h|--help)
+      require_no_args "$@" || exit 1
+      show_help
+      ;;
+    -V|--version)
+      require_no_args "$@" || exit 1
+      print_version
+      ;;
+    build)
+      require_no_args "$@" || exit 1
+      build_image
+      ;;
+    login)
+      cmd_login "$@"
+      ;;
+    start)
+      cmd_start "$@"
+      ;;
+    2fa)
+      cmd_2fa "$@"
+      ;;
+    account)
+      cmd_account "$@"
+      ;;
+    help)
+      require_no_args "$@" || exit 1
+      show_help
+      ;;
+    version)
+      require_no_args "$@" || exit 1
+      print_version
+      ;;
+    *)
+      usage_error "unknown command" "$cmd"
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"
