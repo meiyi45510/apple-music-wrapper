@@ -85,8 +85,8 @@ static int parse_int_option(const char *value, const char *option_name,
 
     errno = 0;
     parsed = strtol(value, &end, 10);
-    if (value[0] == '\0' || *end != '\0' || errno != 0 || parsed < INT_MIN ||
-        parsed > INT_MAX) {
+    if (value[0] == '\0' || *end != '\0' || errno != 0 || parsed < 1 ||
+        parsed > 65535) {
         log_value(stderr, "invalid option value", "%s: %s", option_name,
                   value);
         return -1;

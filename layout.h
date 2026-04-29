@@ -27,6 +27,22 @@ struct std_vector {
     void *end_capacity;
 };
 
+static inline size_t std_vector_size(const struct std_vector *vector,
+                                     size_t element_size) {
+    if (vector == NULL || vector->begin == NULL || vector->end == NULL ||
+        element_size == 0) {
+        return 0;
+    }
+
+    uintptr_t begin = (uintptr_t)vector->begin;
+    uintptr_t end = (uintptr_t)vector->end;
+    if (end < begin) {
+        return 0;
+    }
+
+    return (size_t)((end - begin) / element_size);
+}
+
 static inline union std_string new_std_string(const char *s) {
     union std_string str = {
         .cap = 1,
@@ -36,10 +52,12 @@ static inline union std_string new_std_string(const char *s) {
     return str;
 }
 
-static inline struct std_vector new_std_vector(void *begin) {
+static inline struct std_vector new_std_vector(void *begin, size_t element_size) {
+    void *end =
+        begin == NULL ? NULL : (void *)((char *)begin + element_size);
     struct std_vector vector = {
         .begin = begin,
-        .end = begin + 1,
+        .end = end,
     };
     vector.end_capacity = vector.end;
     return vector;

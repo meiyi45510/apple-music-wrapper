@@ -1,7 +1,9 @@
+#include <ctype.h>
 #include <errno.h>
 #include <dlfcn.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,6 +27,8 @@ enum {
     CURLOPT_VERBOSE = 43,
     CURLOPT_SSL_VERIFYHOST = 81,
     CURLOPT_PINNEDPUBLICKEY = 10230,
+    MAX_DECRYPT_SAMPLE_LEN = 16 * 1024 * 1024,
+    SOCKET_IO_TIMEOUT_SECONDS = 30,
 };
 
 static struct shared_ptr presentation_interface;
@@ -112,6 +116,134 @@ static int file_exists(const char *filename) {
 
 static const char *nonnull_string(const char *value) {
     return value == NULL ? "" : value;
+}
+
+static int parse_positive_decimal_ulong(const char *value, unsigned long *out) {
+    char *end = NULL;
+    unsigned long parsed = 0;
+
+    if (value == NULL || value[0] == '\0' || out == NULL) {
+        return 0;
+    }
+    for (const unsigned char *p = (const unsigned char *)value; *p != '\0';
+         ++p) {
+        if (!isdigit(*p)) {
+            return 0;
+        }
+    }
+
+    errno = 0;
+    parsed = strtoul(value, &end, 10);
+    if (errno != 0 || end == NULL || *end != '\0' || parsed == 0) {
+        return 0;
+    }
+
+    *out = parsed;
+    return 1;
+}
+
+static char *json_escape_string(const char *value) {
+    const unsigned char *input =
+        (const unsigned char *)nonnull_string(value);
+    size_t output_len = 0;
+
+    for (const unsigned char *p = input; *p != '\0'; ++p) {
+        size_t add = 1;
+        switch (*p) {
+        case '"':
+        case '\\':
+        case '\b':
+        case '\f':
+        case '\n':
+        case '\r':
+        case '\t':
+            add = 2;
+            break;
+        default:
+            if (*p < 0x20) {
+                add = 6;
+            }
+            break;
+        }
+        if (output_len > (size_t)-1 - add) {
+            return NULL;
+        }
+        output_len += add;
+    }
+    if (output_len > (size_t)-1 - 1) {
+        return NULL;
+    }
+
+    char *escaped = malloc(output_len + 1);
+    if (escaped == NULL) {
+        return NULL;
+    }
+
+    char *cursor = escaped;
+    for (const unsigned char *p = input; *p != '\0'; ++p) {
+        switch (*p) {
+        case '"':
+            *cursor++ = '\\';
+            *cursor++ = '"';
+            break;
+        case '\\':
+            *cursor++ = '\\';
+            *cursor++ = '\\';
+            break;
+        case '\b':
+            *cursor++ = '\\';
+            *cursor++ = 'b';
+            break;
+        case '\f':
+            *cursor++ = '\\';
+            *cursor++ = 'f';
+            break;
+        case '\n':
+            *cursor++ = '\\';
+            *cursor++ = 'n';
+            break;
+        case '\r':
+            *cursor++ = '\\';
+            *cursor++ = 'r';
+            break;
+        case '\t':
+            *cursor++ = '\\';
+            *cursor++ = 't';
+            break;
+        default:
+            if (*p < 0x20) {
+                snprintf(cursor, 7, "\\u%04x", *p);
+                cursor += 6;
+            } else {
+                *cursor++ = (char)*p;
+            }
+            break;
+        }
+    }
+    *cursor = '\0';
+    return escaped;
+}
+
+static int http_request_matches_root(const char *buffer, const char *method) {
+    const size_t method_len = strlen(method);
+    const char *target = NULL;
+
+    if (strncmp(buffer, method, method_len) != 0 ||
+        buffer[method_len] != ' ') {
+        return 0;
+    }
+
+    target = buffer + method_len + 1;
+    if (target[0] != '/' || target[1] != ' ') {
+        return 0;
+    }
+
+    return strncmp(target + 2, "HTTP/", 5) == 0;
+}
+
+static int is_account_request_allowed(const char *buffer) {
+    return http_request_matches_root(buffer, "GET") ||
+           http_request_matches_root(buffer, "POST");
 }
 
 static int duplicate_substring(const char *src, size_t len, char **out) {
@@ -630,7 +762,8 @@ static void *foot_hill_instance = NULL;
 static void *preshared_context = NULL;
 
 static int should_retry_accept_error(int error_code) {
-    return error_code == ENETDOWN || error_code == EPROTO ||
+    return error_code == EINTR || error_code == ECONNABORTED ||
+           error_code == ENETDOWN || error_code == EPROTO ||
            error_code == ENOPROTOOPT || error_code == EHOSTDOWN ||
 #ifdef ENONET
            error_code == ENONET ||
@@ -676,6 +809,22 @@ static int create_listener_socket(const char *host, int port,
     }
 
     return fd;
+}
+
+static void set_socket_io_timeout(const int fd) {
+    struct timeval timeout = {
+        .tv_sec = SOCKET_IO_TIMEOUT_SECONDS,
+        .tv_usec = 0,
+    };
+
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
+                   sizeof(timeout)) == -1) {
+        log_errno("setsockopt SO_RCVTIMEO");
+    }
+    if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout,
+                   sizeof(timeout)) == -1) {
+        log_errno("setsockopt SO_SNDTIMEO");
+    }
 }
 
 static int accept_client(const int fd, struct sockaddr_in *peer_addr,
@@ -772,8 +921,12 @@ void handle_decrypt_session(const int connfd) {
                 return;
             }
 
-            if (size <= 0) {
+            if (size == 0) {
                 break;
+            }
+            if (size > MAX_DECRYPT_SAMPLE_LEN) {
+                log_value(stderr, "sample too large", "%u", size);
+                return;
             }
 
             void *sample = malloc(size);
@@ -796,22 +949,17 @@ void handle_decrypt_session(const int connfd) {
 
 extern uint8_t handle_decrypt_guarded(int);
 
-static inline int serve_decrypt(void) {
-    const int fd =
-        create_listener_socket(options.host, options.decrypt_port, NULL);
-    if (fd == -1) {
-        return EXIT_FAILURE;
-    }
-
+static inline int serve_decrypt(const int fd) {
     struct sockaddr_in peer_addr;
-    socklen_t peer_addr_size = sizeof(peer_addr);
     while (1) {
+        socklen_t peer_addr_size = sizeof(peer_addr);
         const int connfd = accept_client(fd, &peer_addr, &peer_addr_size);
         if (connfd == -1) {
             log_errno("accept4");
             return EXIT_FAILURE;
         }
 
+        set_socket_io_timeout(connfd);
         if (!handle_decrypt_guarded(connfd)) {
             uint8_t lease_request_enabled = 1;
             _ZN22SVPlaybackLeaseManager12requestLeaseERKb(
@@ -827,6 +975,10 @@ static inline int serve_decrypt(void) {
 static const char *get_m3u8_method_download(
     struct shared_ptr request_context_ref, unsigned long adam) {
     void *purchase_request = malloc(1024);
+    if (purchase_request == NULL) {
+        return NULL;
+    }
+
     _ZN17storeservicescore15PurchaseRequestC2ERKNSt6__ndk110shared_ptrINS_14RequestContextEEE(
         purchase_request, &request_context_ref);
     _ZN17storeservicescore15PurchaseRequest23setProcessDialogActionsEb(
@@ -845,22 +997,43 @@ static const char *get_m3u8_method_download(
     struct shared_ptr *response =
         _ZNK17storeservicescore15PurchaseRequest8responseEv(
             purchase_request);
+    if (response == NULL || response->obj == NULL) {
+        return NULL;
+    }
+
     struct shared_ptr *error =
         _ZN17storeservicescore16PurchaseResponse5errorEv(response->obj);
-    if (error->obj == NULL) {
-        struct std_vector items =
-            _ZNK17storeservicescore16PurchaseResponse5itemsEv(response->obj);
-        struct shared_ptr *first_item = items.begin;
-        struct std_vector assets =
-            _ZNK17storeservicescore12PurchaseItem6assetsEv(first_item->obj);
-        struct shared_ptr *last_asset = (struct shared_ptr *)assets.end - 1;
-        union std_string url_str;
-        _ZNK17storeservicescore13PurchaseAsset3URLEvASM(&url_str,
-                                                         last_asset->obj);
-        const char *url = std_string_data(&url_str);
-        if (url) {
-            return strdup(url);
-        }
+    if (error == NULL || error->obj != NULL) {
+        return NULL;
+    }
+
+    struct std_vector items =
+        _ZNK17storeservicescore16PurchaseResponse5itemsEv(response->obj);
+    if (std_vector_size(&items, sizeof(struct shared_ptr)) == 0) {
+        return NULL;
+    }
+    struct shared_ptr *first_item = items.begin;
+    if (first_item == NULL || first_item->obj == NULL) {
+        return NULL;
+    }
+    struct std_vector assets =
+        _ZNK17storeservicescore12PurchaseItem6assetsEv(first_item->obj);
+    const size_t asset_count =
+        std_vector_size(&assets, sizeof(struct shared_ptr));
+    if (asset_count == 0) {
+        return NULL;
+    }
+    struct shared_ptr *last_asset =
+        (struct shared_ptr *)assets.begin + asset_count - 1;
+    if (last_asset == NULL || last_asset->obj == NULL) {
+        return NULL;
+    }
+    union std_string url_str;
+    _ZNK17storeservicescore13PurchaseAsset3URLEvASM(&url_str,
+                                                     last_asset->obj);
+    const char *url = std_string_data(&url_str);
+    if (url) {
+        return strdup(url);
     }
     return NULL;
 }
@@ -868,7 +1041,7 @@ static const char *get_m3u8_method_download(
 static const char *get_m3u8_method_play(uint8_t lease_manager_buf[16],
                                         unsigned long adam) {
     union std_string hls = new_std_string_short_mode("HLS");
-    struct std_vector hls_params = new_std_vector(&hls);
+    struct std_vector hls_params = new_std_vector(&hls, sizeof(hls));
     static uint8_t z0 = 0;
     struct shared_ptr ptr_result;
     _ZN22SVPlaybackLeaseManager12requestAssetERKmRKNSt6__ndk16vectorINS2_12basic_stringIcNS2_11char_traitsIcEENS2_9allocatorIcEEEENS7_IS9_EEEERKbASM(
@@ -916,7 +1089,13 @@ static void handle_m3u8_request(const int connfd) {
         }
         adam[adam_size] = '\0';
 
-        unsigned long adam_id = strtoul(adam, NULL, 10);
+        unsigned long adam_id = 0;
+        if (!parse_positive_decimal_ulong(adam, &adam_id)) {
+            log_value(stderr, "invalid adam id", "%s", adam);
+            write_full(connfd, "\n", 1);
+            continue;
+        }
+
         const char *m3u8;
         if (is_offline_available) {
             m3u8 = get_m3u8_method_download(request_context, adam_id);
@@ -924,7 +1103,7 @@ static void handle_m3u8_request(const int connfd) {
             m3u8 = get_m3u8_method_play(lease_manager, adam_id);
         }
         if (m3u8 == NULL) {
-            log_value(stderr, "m3u8 missing", "%ld", adam_id);
+            log_value(stderr, "m3u8 missing", "%lu", adam_id);
             write_full(connfd, "\n", 1);
         } else {
             char *with_newline = malloc(strlen(m3u8) + 2);
@@ -940,23 +1119,21 @@ static void handle_m3u8_request(const int connfd) {
 }
 
 static inline void *serve_m3u8(void *args) {
-    (void)args;
-    const int fd = create_listener_socket(options.host,
-                                          options.m3u8_port,
-                                          "m3u8");
-    if (fd == -1) {
+    if (args == NULL) {
         return NULL;
     }
 
+    const int fd = *(const int *)args;
     struct sockaddr_in peer_addr;
-    socklen_t peer_addr_size = sizeof(peer_addr);
     while (1) {
+        socklen_t peer_addr_size = sizeof(peer_addr);
         const int connfd = accept_client(fd, &peer_addr, &peer_addr_size);
         if (connfd == -1) {
             log_errno("accept4");
             return NULL;
         }
 
+        set_socket_io_timeout(connfd);
         handle_m3u8_request(connfd);
 
         if (close(connfd) == -1) {
@@ -974,7 +1151,7 @@ static void handle_account_request(const int connfd) {
         return;
     }
 
-    if (strncmp(buffer, "GET", 3) != 0 && strncmp(buffer, "POST", 4) != 0) {
+    if (!is_account_request_allowed(buffer)) {
         log_value(stderr, "invalid account request", "%.16s", buffer);
         const char *error_response =
             "HTTP/1.1 400 Bad Request\r\n"
@@ -988,11 +1165,31 @@ static void handle_account_request(const int connfd) {
     const char *storefront_id = nonnull_string(cached_storefront_id);
     const char *dev_token = nonnull_string(cached_dev_token);
     const char *music_token = nonnull_string(cached_music_token);
+    char *escaped_storefront_id = json_escape_string(storefront_id);
+    char *escaped_dev_token = json_escape_string(dev_token);
+    char *escaped_music_token = json_escape_string(music_token);
+    if (escaped_storefront_id == NULL || escaped_dev_token == NULL ||
+        escaped_music_token == NULL) {
+        free(escaped_storefront_id);
+        free(escaped_dev_token);
+        free(escaped_music_token);
+        log_state(stderr, "account info escape", "failed");
+        const char *error_response =
+            "HTTP/1.1 500 Internal Server Error\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: 0\r\n\r\n";
+        write_full(connfd, error_response, strlen(error_response));
+        return;
+    }
+
     int json_len = snprintf(
         NULL, 0,
         "{\"storefront_id\":\"%s\",\"dev_token\":\"%s\",\"music_token\":\"%s\"}",
-        storefront_id, dev_token, music_token);
+        escaped_storefront_id, escaped_dev_token, escaped_music_token);
     if (json_len < 0) {
+        free(escaped_storefront_id);
+        free(escaped_dev_token);
+        free(escaped_music_token);
         log_state(stderr, "account info format", "failed");
         const char *error_response =
             "HTTP/1.1 500 Internal Server Error\r\n"
@@ -1004,6 +1201,9 @@ static void handle_account_request(const int connfd) {
 
     char *json_body = malloc((size_t)json_len + 1);
     if (json_body == NULL) {
+        free(escaped_storefront_id);
+        free(escaped_dev_token);
+        free(escaped_music_token);
         log_state(stderr, "account info allocation", "failed");
         const char *error_response =
             "HTTP/1.1 500 Internal Server Error\r\n"
@@ -1016,7 +1216,10 @@ static void handle_account_request(const int connfd) {
     snprintf(
         json_body, (size_t)json_len + 1,
         "{\"storefront_id\":\"%s\",\"dev_token\":\"%s\",\"music_token\":\"%s\"}",
-        storefront_id, dev_token, music_token);
+        escaped_storefront_id, escaped_dev_token, escaped_music_token);
+    free(escaped_storefront_id);
+    free(escaped_dev_token);
+    free(escaped_music_token);
 
     int response_len = snprintf(
         NULL, 0,
@@ -1065,23 +1268,21 @@ static void handle_account_request(const int connfd) {
 }
 
 static inline void *serve_account(void *args) {
-    (void)args;
-    const int fd = create_listener_socket(options.host,
-                                          options.account_port,
-                                          "account");
-    if (fd == -1) {
+    if (args == NULL) {
         return NULL;
     }
 
+    const int fd = *(const int *)args;
     struct sockaddr_in peer_addr;
-    socklen_t peer_addr_size = sizeof(peer_addr);
     while (1) {
+        socklen_t peer_addr_size = sizeof(peer_addr);
         const int connfd = accept_client(fd, &peer_addr, &peer_addr_size);
         if (connfd == -1) {
             log_errno("accept4");
             return NULL;
         }
 
+        set_socket_io_timeout(connfd);
         handle_account_request(connfd);
 
         if (close(connfd) == -1) {
@@ -1120,8 +1321,11 @@ static void write_storefront_id(void) {
 }
 
 static char *get_guid(void) {
-    char *ret[2];
+    char *ret[2] = {NULL, NULL};
     _ZN17storeservicescore10DeviceGUID4guidEvASM(ret, guid_handle.obj);
+    if (ret[0] == NULL) {
+        return NULL;
+    }
     char *guid = _ZNK13mediaplatform4Data5bytesEv(ret[0]);
     return guid;
 }
@@ -1197,18 +1401,30 @@ static char *get_music_user_token(char *guid, char *auth_token,
     _ZN17storeservicescore10URLRequest3runEv(url_request);
     struct shared_ptr *err =
         _ZNK17storeservicescore10URLRequest5errorEv(url_request);
-    if (err->obj != NULL) {
+    if (err == NULL || err->obj != NULL) {
         return NULL;
     }
     struct shared_ptr *url_response =
         _ZNK17storeservicescore10URLRequest8responseEv(url_request);
+    if (url_response == NULL || url_response->obj == NULL) {
+        return NULL;
+    }
     struct shared_ptr *resp =
         _ZNK17storeservicescore11URLResponse18underlyingResponseEv(
             url_response->obj);
+    if (resp == NULL || resp->obj == NULL) {
+        return NULL;
+    }
     void *http_message_obj = resp->obj;
     void **data_ptr_location = (void **)((char *)http_message_obj + 48);
     void *data_ptr = *data_ptr_location;
+    if (data_ptr == NULL) {
+        return NULL;
+    }
     char *response_body = _ZNK13mediaplatform4Data5bytesEv(data_ptr);
+    if (response_body == NULL) {
+        return NULL;
+    }
     return json_extract_string(response_body, "music_token");
 }
 
@@ -1237,18 +1453,30 @@ static char *get_dev_token(struct shared_ptr request_context_ref) {
     _ZN17storeservicescore10URLRequest3runEv(url_request);
     struct shared_ptr *err =
         _ZNK17storeservicescore10URLRequest5errorEv(url_request);
-    if (err->obj != NULL) {
+    if (err == NULL || err->obj != NULL) {
         return NULL;
     }
     struct shared_ptr *url_response =
         _ZNK17storeservicescore10URLRequest8responseEv(url_request);
+    if (url_response == NULL || url_response->obj == NULL) {
+        return NULL;
+    }
     struct shared_ptr *resp =
         _ZNK17storeservicescore11URLResponse18underlyingResponseEv(
             url_response->obj);
+    if (resp == NULL || resp->obj == NULL) {
+        return NULL;
+    }
     void *http_message_obj = resp->obj;
     void **data_ptr_location = (void **)((char *)http_message_obj + 48);
     void *data_ptr = *data_ptr_location;
+    if (data_ptr == NULL) {
+        return NULL;
+    }
     char *response_body = _ZNK13mediaplatform4Data5bytesEv(data_ptr);
+    if (response_body == NULL) {
+        return NULL;
+    }
     return json_extract_string(response_body, "token");
 }
 
@@ -1258,29 +1486,48 @@ static void write_music_token(void) {
         return;
     }
 
-    if (file_exists(path)) {
-        FILE *fp = fopen(path, "r");
-        if (fp != NULL) {
-            fseek(fp, 0, SEEK_END);
-            if (ftell(fp) != 0) {
-                fclose(fp);
-                free(path);
-                log_state(stdout, "music token", "kept");
-                return;
-            }
-            fclose(fp);
-        }
+    size_t path_len = strlen(path);
+    char *tmp_path = malloc(path_len + 5);
+    if (tmp_path == NULL) {
+        free(path);
+        return;
+    }
+    snprintf(tmp_path, path_len + 5, "%s.tmp", path);
+
+    FILE *fp = fopen(tmp_path, "w");
+    if (fp == NULL) {
+        free(tmp_path);
+        free(path);
+        return;
     }
 
-    FILE *fp = fopen(path, "w");
-    free(path);
-    if (fp == NULL) {
+    if (fprintf(fp, "%s", nonnull_string(cached_music_token)) < 0 ||
+        fflush(fp) != 0 || fsync(fileno(fp)) != 0) {
+        log_errno("write music token");
+        fclose(fp);
+        remove(tmp_path);
+        free(tmp_path);
+        free(path);
+        return;
+    }
+    if (fclose(fp) != 0) {
+        log_errno("close music token");
+        remove(tmp_path);
+        free(tmp_path);
+        free(path);
+        return;
+    }
+    if (rename(tmp_path, path) != 0) {
+        log_errno("rename music token");
+        remove(tmp_path);
+        free(tmp_path);
+        free(path);
         return;
     }
 
     log_state(stdout, "music token", "saved");
-    fprintf(fp, "%s", nonnull_string(cached_music_token));
-    fclose(fp);
+    free(tmp_path);
+    free(path);
 }
 
 static int offline_available(void) {
@@ -1291,9 +1538,19 @@ static int offline_available(void) {
 
     _ZN17storeservicescore14RequestContext8fairPlayEvASM(
         fairplay, request_context.obj);
+    if (fairplay->obj == NULL) {
+        free(fairplay);
+        return 0;
+    }
+
     struct std_vector fairplay_status =
         _ZN17storeservicescore8FairPlay21getSubscriptionStatusEv(
             fairplay->obj);
+    if (std_vector_size(&fairplay_status, 16) < 2) {
+        free(fairplay);
+        return 0;
+    }
+
     char *begin_ptr = (char *)fairplay_status.begin;
     char *second_item_ptr = begin_ptr + 16;
     int state = *(int *)((char *)second_item_ptr + 8);
@@ -1306,6 +1563,9 @@ static int offline_available(void) {
 
 int main(int argc, char *argv[]) {
     int thread_error = 0;
+    int m3u8_fd = -1;
+    int account_fd = -1;
+    int decrypt_fd = -1;
 
     if (cli_options_parse(argc, argv, &options) != 0) {
         return EXIT_FAILURE;
@@ -1368,30 +1628,57 @@ int main(int argc, char *argv[]) {
     write_storefront_id();
     write_music_token();
 
+    m3u8_fd = create_listener_socket(options.host, options.m3u8_port, "m3u8");
+    if (m3u8_fd == -1) {
+        goto fail;
+    }
+    account_fd =
+        create_listener_socket(options.host, options.account_port, "account");
+    if (account_fd == -1) {
+        goto fail;
+    }
+    decrypt_fd =
+        create_listener_socket(options.host, options.decrypt_port, NULL);
+    if (decrypt_fd == -1) {
+        goto fail;
+    }
+
     pthread_t m3u8_thread;
-    thread_error = pthread_create(&m3u8_thread, NULL, &serve_m3u8, NULL);
+    thread_error = pthread_create(&m3u8_thread, NULL, &serve_m3u8, &m3u8_fd);
     if (thread_error != 0) {
         output_thread_error("pthread_create m3u8", thread_error);
-        return EXIT_FAILURE;
+        goto fail;
     }
     thread_error = pthread_detach(m3u8_thread);
     if (thread_error != 0) {
         output_thread_error("pthread_detach m3u8", thread_error);
-        return EXIT_FAILURE;
+        goto fail;
     }
 
     pthread_t account_thread;
     thread_error =
-        pthread_create(&account_thread, NULL, &serve_account, NULL);
+        pthread_create(&account_thread, NULL, &serve_account, &account_fd);
     if (thread_error != 0) {
         output_thread_error("pthread_create account", thread_error);
-        return EXIT_FAILURE;
+        goto fail;
     }
     thread_error = pthread_detach(account_thread);
     if (thread_error != 0) {
         output_thread_error("pthread_detach account", thread_error);
-        return EXIT_FAILURE;
+        goto fail;
     }
 
-    return serve_decrypt();
+    return serve_decrypt(decrypt_fd);
+
+fail:
+    if (m3u8_fd != -1) {
+        close(m3u8_fd);
+    }
+    if (account_fd != -1) {
+        close(account_fd);
+    }
+    if (decrypt_fd != -1) {
+        close(decrypt_fd);
+    }
+    return EXIT_FAILURE;
 }
